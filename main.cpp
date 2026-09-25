@@ -13,8 +13,13 @@ using namespace std;
 
 struct Config {
     string target;
-    int    bits     = 0;
-    int    split    = 2;   // 前 split 个文件归 AB，其余归 CD
+    int    bits      = 0;
+    int    split     = 2;
+    string hw_filter     = "";  // hw(a&b)/hw(c&d) AND 过滤对文件，空=不过滤
+    string hw_xor_filter = "";  // hw(a^b)/hw(c^d) XOR 过滤对文件，空=不过滤
+    string hw_sum_filter = "";  // hw(a)+hw(b)/hw(c)+hw(d) 和过滤对文件，空=不过滤
+    string ab_ranges = "";      // AB 字节范围优先级文件（a=r13, b=r14）
+    string cd_ranges = "";      // CD 字节范围分区文件（c=r15, d=r16）
     map<string,string> rPaths;
     vector<int> gpuIds   = {0};
     vector<int> gridSize;
@@ -42,7 +47,12 @@ static Config parseConf(const string &path) {
         auto cm=v.find('#'); if(cm!=string::npos) v=trim(v.substr(0,cm));
         if      (k=="target") cfg.target = v;
         else if (k=="bits")   cfg.bits   = stoi(v);
-        else if (k=="split")  cfg.split  = stoi(v);
+        else if (k=="split")     cfg.split     = stoi(v);
+        else if (k=="hw_filter")     cfg.hw_filter     = v;
+        else if (k=="hw_xor_filter") cfg.hw_xor_filter = v;
+        else if (k=="hw_sum_filter") cfg.hw_sum_filter = v;
+        else if (k=="ab_ranges")     cfg.ab_ranges     = v;
+        else if (k=="cd_ranges")     cfg.cd_ranges     = v;
         else if (k=="r12")    cfg.rPaths["r12"]=v;
         else if (k=="r13")    cfg.rPaths["r13"]=v;
         else if (k=="r14")    cfg.rPaths["r14"]=v;
@@ -52,6 +62,85 @@ static Config parseConf(const string &path) {
         else if (k=="output") cfg.output = v;
     }
     return cfg;
+}
+
+// 从 txt 加载 (hw_ab, hw_cd) 对
+// 支持 "hw_ab hw_cd" 或 "序号 hw_ab hw_cd" 两种格式，# 开头为注释
+static vector<pair<int,int>> loadHwPairs(const string &path) {
+    vector<pair<int,int>> pairs;
+    ifstream f(path);
+    if (!f) { printf("无法打开 hw_filter 文件: %s\n", path.c_str()); exit(1); }
+    string line;
+    while (getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        // 提取所有整数
+        istringstream ss(line);
+        vector<int> nums;
+        int x;
+        while (ss >> x) nums.push_back(x);
+        if (nums.size() == 2)
+            pairs.push_back({nums[0], nums[1]});
+        else if (nums.size() >= 3)
+            pairs.push_back({nums[1], nums[2]});  // 第一列为序号，跳过
+    }
+    return pairs;
+}
+
+// 解析一个 uint8_t 整数（0-255）
+static uint8_t parseU8(const string &s) {
+    int v = stoi(s);
+    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+
+// 加载 AB 字节范围文件：每行 8 个整数
+// a_hi_lo a_hi_hi a_lo_lo a_lo_hi  b_hi_lo b_hi_hi b_lo_lo b_lo_hi
+static vector<ABRangeRow> loadABRanges(const string &path) {
+    vector<ABRangeRow> rows;
+    ifstream f(path);
+    if (!f) { printf("无法打开 ab_ranges 文件: %s\n", path.c_str()); exit(1); }
+    string line;
+    while (getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        istringstream ss(line);
+        vector<int> nums;
+        int x;
+        while (ss >> x) nums.push_back(x);
+        if ((int)nums.size() < 8) continue;
+        ABRangeRow row;
+        row.a = {parseU8(to_string(nums[0])), parseU8(to_string(nums[1])),
+                 parseU8(to_string(nums[2])), parseU8(to_string(nums[3]))};
+        row.b = {parseU8(to_string(nums[4])), parseU8(to_string(nums[5])),
+                 parseU8(to_string(nums[6])), parseU8(to_string(nums[7]))};
+        rows.push_back(row);
+    }
+    return rows;
+}
+
+// 加载 CD 字节范围文件：每行 8 个整数
+// c_hi_lo c_hi_hi c_lo_lo c_lo_hi  d_hi_lo d_hi_hi d_lo_lo d_lo_hi
+static vector<CDRangeRow> loadCDRanges(const string &path) {
+    vector<CDRangeRow> rows;
+    ifstream f(path);
+    if (!f) { printf("无法打开 cd_ranges 文件: %s\n", path.c_str()); exit(1); }
+    string line;
+    while (getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#') continue;
+        istringstream ss(line);
+        vector<int> nums;
+        int x;
+        while (ss >> x) nums.push_back(x);
+        if ((int)nums.size() < 8) continue;
+        CDRangeRow row;
+        row.c = {parseU8(to_string(nums[0])), parseU8(to_string(nums[1])),
+                 parseU8(to_string(nums[2])), parseU8(to_string(nums[3]))};
+        row.d = {parseU8(to_string(nums[4])), parseU8(to_string(nums[5])),
+                 parseU8(to_string(nums[6])), parseU8(to_string(nums[7]))};
+        rows.push_back(row);
+    }
+    return rows;
 }
 
 static vector<uint16_t> loadR(const string &path) {
@@ -96,6 +185,31 @@ int main(int argc, char *argv[])
 
     Secp256K1 *secp = new Secp256K1(); secp->Init();
     PuzzleSolve ps(secp, cfg.target, cfg.output);
-    ps.Search(patterns, cfg.bits, cfg.split, cfg.gpuIds, cfg.gridSize);
+    vector<pair<int,int>> hwPairs, hwXorPairs;
+    if (!cfg.hw_filter.empty() && cfg.hw_filter != "0") {
+        hwPairs = loadHwPairs(cfg.hw_filter);
+        printf("hw AND 过滤: %s  (%zu 对)\n", cfg.hw_filter.c_str(), hwPairs.size());
+    }
+    if (!cfg.hw_xor_filter.empty() && cfg.hw_xor_filter != "0") {
+        hwXorPairs = loadHwPairs(cfg.hw_xor_filter);
+        printf("hw XOR 过滤: %s  (%zu 对)\n", cfg.hw_xor_filter.c_str(), hwXorPairs.size());
+    }
+    vector<pair<int,int>> hwSumPairs;
+    if (!cfg.hw_sum_filter.empty() && cfg.hw_sum_filter != "0") {
+        hwSumPairs = loadHwPairs(cfg.hw_sum_filter);
+        printf("hw sum 过滤: %s  (%zu 对)\n", cfg.hw_sum_filter.c_str(), hwSumPairs.size());
+    }
+    vector<ABRangeRow> abRanges;
+    vector<CDRangeRow> cdRanges;
+    if (!cfg.ab_ranges.empty() && cfg.ab_ranges != "0") {
+        abRanges = loadABRanges(cfg.ab_ranges);
+        printf("AB 范围过滤: %s  (%zu 行)\n", cfg.ab_ranges.c_str(), abRanges.size());
+    }
+    if (!cfg.cd_ranges.empty() && cfg.cd_ranges != "0") {
+        cdRanges = loadCDRanges(cfg.cd_ranges);
+        printf("CD 范围过滤: %s  (%zu 区)\n", cfg.cd_ranges.c_str(), cdRanges.size());
+    }
+    ps.Search(patterns, cfg.bits, cfg.split, cfg.gpuIds, cfg.gridSize,
+              hwPairs, hwXorPairs, abRanges, cdRanges, hwSumPairs);
     return 0;
 }

@@ -108,12 +108,21 @@ private:
 struct ABCDContext;
 
 ABCDContext *abcdSetup(
-    uint64_t *abTable, uint32_t abSize,
-    uint64_t *cdTable, uint32_t cdSize,
+    uint64_t *abTable, uint8_t *abHwTable, uint8_t *abHwTable2, uint32_t abSize,
+    uint64_t *cdTable, uint8_t *cdHwTable, uint8_t *cdHwTable2, uint32_t cdSize,
     uint8_t *targetH160, prefix_t targetPrefix,
-    uint32_t maxFound);
+    uint32_t maxFound,
+    const std::vector<std::pair<int,int>> &hwPairs     = {},
+    const std::vector<std::pair<int,int>> &hwXorPairs  = {},
+    int      forced_nc    = 0,       // 0=自动选并打印，>0=静默使用该值
+    uint8_t *abHwSumR13   = nullptr, // hw(r13) popcount per AB entry
+    uint8_t *cdHwSumR14   = nullptr, // hw(r14) popcount per CD entry
+    uint8_t *cdHwSumR15   = nullptr, // hw(r15) popcount per CD entry
+    const std::vector<std::pair<int,int>> &hwSumPairs = {},
+    uint8_t  hw_outer_sum = 0xFF);   // hw(r16)，0xFF=不启用和过滤
 
 void abcdFree(ABCDContext *ctx);
+int  abcdGetNC(ABCDContext *ctx);  // 返回 optimal_nc，用于有序搜索时复用
 
 bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
                 std::vector<std::tuple<uint32_t,uint32_t,uint8_t>> &found);

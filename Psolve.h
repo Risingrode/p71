@@ -2,8 +2,22 @@
 #include <string>
 #include <vector>
 #include <tuple>
+#include <utility>
+#include <cstdint>
 #include "crypto/SECP256k1.h"
 #include "GPU/GPUEngine.h"
+
+// 16-bit 段值的高低字节范围约束
+struct ByteRange {
+    uint8_t hi_lo = 0, hi_hi = 255;  // 高字节（n0-n7）范围
+    uint8_t lo_lo = 0, lo_hi = 255;  // 低字节（n8-n15）范围
+    bool matches(uint16_t v) const {
+        uint8_t hi = (uint8_t)(v >> 8), lo = (uint8_t)(v & 0xFF);
+        return hi >= hi_lo && hi <= hi_hi && lo >= lo_lo && lo <= lo_hi;
+    }
+};
+struct ABRangeRow { ByteRange a, b; };  // a=r13, b=r14
+struct CDRangeRow { ByteRange c, d; };  // c=r15, d=r16(outer)
 
 // AB+CD 组合搜索：
 //   AB 表 = patterns[0..splitIdx-1] 的笛卡尔积
@@ -19,7 +33,12 @@ public:
     // splitIdx: 前 splitIdx 个文件归 AB，其余归 CD（默认 2）
     void Search(std::vector<std::vector<uint16_t>> &patterns,
                 int bits, int splitIdx,
-                std::vector<int> gpuId, std::vector<int> gridSize);
+                std::vector<int> gpuId, std::vector<int> gridSize,
+                const std::vector<std::pair<int,int>> &hwPairs    = {},
+                const std::vector<std::pair<int,int>> &hwXorPairs = {},
+                const std::vector<ABRangeRow>         &abRanges   = {},
+                const std::vector<CDRangeRow>         &cdRanges   = {},
+                const std::vector<std::pair<int,int>> &hwSumPairs = {});
 
 private:
     // 私钥重建与验证
@@ -61,6 +80,8 @@ private:
                             const std::vector<int> &shifts,
                             const std::vector<int> &chunks,
                             std::vector<uint64_t> &result,
+                            std::vector<uint8_t>  &hwResult,
+                            std::vector<uint8_t>  &hwXorResult,
                             uint32_t &size,
                             bool hasBase = false,
                             const Point &basePoint = Point());

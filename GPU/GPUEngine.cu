@@ -846,36 +846,190 @@ bool GPUEngine::Check(Secp256K1 *secp) {
 // 独立于 GPUEngine 类，直接分配显存、上传表、启动 kernel
 
 struct ABCDContext {
-  uint64_t *d_ab;       // GPU 上的 AB 表
-  uint64_t *d_cd;       // GPU 上的 CD 表
-  uint32_t *d_out;      // GPU 上的输出缓冲
-  uint32_t *h_out;      // CPU 端固定内存输出缓冲
+  uint64_t *d_ab;          // GPU 上的 AB 表
+  uint64_t *d_cd;          // GPU 上的 CD 表
+  uint8_t  *d_ab_hw;      // AB hw(c&d) AND，nullptr=不过滤
+  uint8_t  *d_cd_hw;      // CD hw(a&b) AND，nullptr=不过滤
+  uint8_t  *d_ab_hw2;     // AB hw(c^d) XOR，nullptr=不过滤
+  uint8_t  *d_cd_hw2;     // CD hw(a^b) XOR，nullptr=不过滤
+  uint8_t  *d_ab_sum_r13; // AB hw(r13) popcount，nullptr=不过滤
+  uint8_t  *d_cd_sum_r14; // CD hw(r14) popcount
+  uint8_t  *d_cd_sum_r15; // CD hw(r15) popcount
+  uint32_t *d_out;         // GPU 上的输出缓冲
+  uint32_t *h_out;         // CPU 端固定内存输出缓冲
   uint32_t abSize;
   uint32_t cdSize;
   uint32_t maxFound;
   prefix_t targetPrefix;
+  int      optimal_nc;     // 自动适配的批量求逆大小
+  int      block_size;     // kernel block 大小
 };
 
-// 初始化：上传表数据、设置目标 hash
+// ── 根据 GPU 架构 + CD 表大小自动选择最优 ABCD_NC ────────────────────────
+//
+// 双维度优化：
+// 1. L1 大小决定 NC 基准（_ModInvGroupedN 的 subp stack 命中率）
+// 2. CD 表是否放得进 L2 决定 NC 微调方向：
+//    ・CD < L2（小表）→ L2 可以缓存 CD，但 ModInv 频繁调用会污染 L2。
+//      用更大 NC 减少 ModInv 调用频率，保护 L2 里的 CD 缓存。
+//    ・CD >> L2（大表）→ CD 全走 DRAM，subp 同样走 DRAM。
+//      用更小 NC 减小 subp 的 DRAM 带宽占用，降低与 CD 的冲突。
+//
+// T4 实测最优点：小 CD 表用 NC=160，大 CD 表用 NC=128
+static int abcdSelectNC(int gpuId, uint32_t cdSize)
+{
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, gpuId);
+
+  int sm = prop.major * 10 + prop.minor;
+
+  // 各架构 L1 cache 大小（PreferL1 模式，单位 KB）
+  int l1_kb;
+  if      (sm >= 120) l1_kb = 128;  // SM 12.0+: Blackwell 工作站/消费级
+  else if (sm >= 100) l1_kb = 228;  // SM 10.0:  Blackwell 数据中心 (B100/B200)
+  else if (sm >=  90) l1_kb = 256;  // SM 9.0:   Hopper (H100/H200)
+  else if (sm >=  89) l1_kb = 128;  // SM 8.9:   Ada Lovelace (RTX 4090, RTX A6000 Ada)
+  else if (sm >=  86) l1_kb = 128;  // SM 8.6:   Ampere 消费/专业 (RTX 3090, A10, RTX A1000)
+  else if (sm >=  80) l1_kb = 192;  // SM 8.0:   Ampere 数据中心 (A100)
+  else if (sm >=  75) l1_kb =  32;  // SM 7.5:   Turing (T4, RTX 2080)
+  else if (sm >=  70) l1_kb = 128;  // SM 7.0:   Volta (V100)
+  else                l1_kb =  32;  // 更老架构保守默认值
+
+  // L2 大小（字节），CUDA DeviceProp 有直接字段
+  int l2_bytes = prop.l2CacheSize;
+
+  // CD 表字节数（每个 EC 点 64 字节）
+  size_t cd_bytes = (size_t)cdSize * 64;
+
+  // 基础 NC：L1_KB × 4，夹在 [128, 512]
+  int nc_base = l1_kb * 4;
+  if (nc_base <= 128) nc_base = 128;
+  else if (nc_base <= 256) nc_base = 256;
+  else nc_base = 512;
+
+  // CD 表放得进 L2 时，适当增大 NC（减少 ModInv 对 L2 的污染）
+  // 经验因子：1.25×（T4 实测 128→160 对小 CD 表有 +2% 提升）
+  int nc;
+  if (l2_bytes > 0 && cd_bytes < (size_t)l2_bytes) {
+    // 小 CD 表：NC 增大 25%，让 L2 更专注缓存 CD
+    nc = (int)(nc_base * 1.25f);
+    // 对齐到 16 的倍数，不超过 nc_base × 2
+    nc = (nc / 16) * 16;
+    nc = nc > nc_base * 2 ? nc_base * 2 : nc;
+  } else {
+    // 大 CD 表：使用基础 NC（减小 DRAM 带宽竞争）
+    nc = nc_base;
+  }
+
+  printf("GPU #%d %s (SM %d.%d): L1≈%dKB L2≈%dMB CD=%zuKB → ABCD_NC=%d, block=128\n",
+         gpuId, prop.name, prop.major, prop.minor,
+         l1_kb, l2_bytes/1024/1024,
+         cd_bytes/1024, nc);
+  return nc;
+}
+
+// 初始化：上传表数据、设置目标 hash、自动选 NC
 ABCDContext *abcdSetup(
-    uint64_t *abTable, uint32_t abSize,
-    uint64_t *cdTable, uint32_t cdSize,
+    uint64_t *abTable, uint8_t *abHwTable, uint8_t *abHwTable2, uint32_t abSize,
+    uint64_t *cdTable, uint8_t *cdHwTable, uint8_t *cdHwTable2, uint32_t cdSize,
     uint8_t *targetH160, prefix_t targetPrefix,
-    uint32_t maxFound)
+    uint32_t maxFound,
+    const std::vector<std::pair<int,int>> &hwPairs,
+    const std::vector<std::pair<int,int>> &hwXorPairs,
+    int forced_nc,
+    uint8_t *abHwSumR13, uint8_t *cdHwSumR14, uint8_t *cdHwSumR15,
+    const std::vector<std::pair<int,int>> &hwSumPairs,
+    uint8_t hw_outer_sum)
 {
   ABCDContext *ctx = new ABCDContext();
-  ctx->abSize      = abSize;
-  ctx->cdSize      = cdSize;
-  ctx->maxFound    = maxFound;
-  ctx->targetPrefix = targetPrefix;
+  ctx->abSize        = abSize;
+  ctx->cdSize        = cdSize;
+  ctx->maxFound      = maxFound;
+  ctx->targetPrefix  = targetPrefix;
+  ctx->block_size    = 128;
+  ctx->d_ab_hw       = nullptr;
+  ctx->d_cd_hw       = nullptr;
+  ctx->d_ab_hw2      = nullptr;
+  ctx->d_cd_hw2      = nullptr;
+  ctx->d_ab_sum_r13  = nullptr;
+  ctx->d_cd_sum_r14  = nullptr;
+  ctx->d_cd_sum_r15  = nullptr;
+
+  // 构建 hw 有效对表并上传到 GPU 常量内存
+  // _hw_valid[hw_ab][hw_cd] = 1 表示该对有效
+  if (!hwPairs.empty()) {
+    uint8_t valid[17][17] = {};
+    for (auto &p : hwPairs)
+      if (p.first >= 0 && p.first <= 16 && p.second >= 0 && p.second <= 16)
+        valid[p.first][p.second] = 1;
+    cudaMemcpyToSymbol(_hw_valid, valid, sizeof(valid));
+  }
+  if (!hwXorPairs.empty()) {
+    uint8_t valid2[17][17] = {};
+    for (auto &p : hwXorPairs)
+      if (p.first >= 0 && p.first <= 16 && p.second >= 0 && p.second <= 16)
+        valid2[p.first][p.second] = 1;
+    cudaMemcpyToSymbol(_hw_valid2, valid2, sizeof(valid2));
+  }
+
+  // 选最优 NC（forced_nc>0 时静默复用已知值，否则自动选并打印）
+  int gpuId = 0;
+  cudaGetDevice(&gpuId);
+  ctx->optimal_nc = (forced_nc > 0) ? forced_nc : abcdSelectNC(gpuId, cdSize);
 
   // 上传 AB 表
   cudaMalloc(&ctx->d_ab, (size_t)abSize * 8 * sizeof(uint64_t));
   cudaMemcpy(ctx->d_ab, abTable, (size_t)abSize * 8 * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
+  // 上传 AB hw 表（AND / XOR 各可选）
+  if (abHwTable) {
+    cudaMalloc(&ctx->d_ab_hw, (size_t)abSize);
+    cudaMemcpy(ctx->d_ab_hw, abHwTable, (size_t)abSize, cudaMemcpyHostToDevice);
+  }
+  if (abHwTable2) {
+    cudaMalloc(&ctx->d_ab_hw2, (size_t)abSize);
+    cudaMemcpy(ctx->d_ab_hw2, abHwTable2, (size_t)abSize, cudaMemcpyHostToDevice);
+  }
+
   // 上传 CD 表
   cudaMalloc(&ctx->d_cd, (size_t)cdSize * 8 * sizeof(uint64_t));
   cudaMemcpy(ctx->d_cd, cdTable, (size_t)cdSize * 8 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+  // 上传 CD hw 表（AND / XOR 各可选）
+  if (cdHwTable) {
+    cudaMalloc(&ctx->d_cd_hw, (size_t)cdSize);
+    cudaMemcpy(ctx->d_cd_hw, cdHwTable, (size_t)cdSize, cudaMemcpyHostToDevice);
+  }
+  if (cdHwTable2) {
+    cudaMalloc(&ctx->d_cd_hw2, (size_t)cdSize);
+    cudaMemcpy(ctx->d_cd_hw2, cdHwTable2, (size_t)cdSize, cudaMemcpyHostToDevice);
+  }
+
+  // 上传 sum 过滤表（hw(r13)/r14/r15 per entry，nullptr=不启用）
+  if (abHwSumR13) {
+    cudaMalloc(&ctx->d_ab_sum_r13, (size_t)abSize);
+    cudaMemcpy(ctx->d_ab_sum_r13, abHwSumR13, (size_t)abSize, cudaMemcpyHostToDevice);
+  }
+  if (cdHwSumR14) {
+    cudaMalloc(&ctx->d_cd_sum_r14, (size_t)cdSize);
+    cudaMemcpy(ctx->d_cd_sum_r14, cdHwSumR14, (size_t)cdSize, cudaMemcpyHostToDevice);
+  }
+  if (cdHwSumR15) {
+    cudaMalloc(&ctx->d_cd_sum_r15, (size_t)cdSize);
+    cudaMemcpy(ctx->d_cd_sum_r15, cdHwSumR15, (size_t)cdSize, cudaMemcpyHostToDevice);
+  }
+
+  // 上传和有效对表到常量内存（33×33 字节）
+  if (!hwSumPairs.empty()) {
+    uint8_t sv[33][33] = {};
+    for (auto &p : hwSumPairs)
+      if (p.first >= 0 && p.first <= 32 && p.second >= 0 && p.second <= 32)
+        sv[p.first][p.second] = 1;
+    cudaMemcpyToSymbol(_sum_valid, sv, sizeof(sv));
+  }
+
+  // 上传当前外层 r16 的 popcount 到常量内存
+  cudaMemcpyToSymbol(_hw_r16_sum, &hw_outer_sum, 1);
 
   // 上传目标 hash160 到常量内存（20 字节 = 5 uint32_t）
   cudaMemcpyToSymbol(_abcd_target, targetH160, 20);
@@ -888,15 +1042,24 @@ ABCDContext *abcdSetup(
   return ctx;
 }
 
+int abcdGetNC(ABCDContext *ctx) { return ctx->optimal_nc; }
+
 void abcdFree(ABCDContext *ctx) {
   cudaFree(ctx->d_ab);
+  if (ctx->d_ab_hw)       cudaFree(ctx->d_ab_hw);
+  if (ctx->d_ab_hw2)      cudaFree(ctx->d_ab_hw2);
+  if (ctx->d_ab_sum_r13)  cudaFree(ctx->d_ab_sum_r13);
   cudaFree(ctx->d_cd);
+  if (ctx->d_cd_hw)       cudaFree(ctx->d_cd_hw);
+  if (ctx->d_cd_hw2)      cudaFree(ctx->d_cd_hw2);
+  if (ctx->d_cd_sum_r14)  cudaFree(ctx->d_cd_sum_r14);
+  if (ctx->d_cd_sum_r15)  cudaFree(ctx->d_cd_sum_r15);
   cudaFree(ctx->d_out);
   cudaFreeHost(ctx->h_out);
   delete ctx;
 }
 
-// 启动一批组合的检查，返回命中列表
+// ── 启动一批组合的检查，返回命中列表 ───────────────────────────────────────
 // startCombo ~ startCombo+numCombos-1 的组合由本次 kernel 处理
 bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
                 std::vector<std::tuple<uint32_t,uint32_t,uint8_t>> &found)
@@ -904,23 +1067,34 @@ bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
   found.clear();
   if (numCombos == 0) return true;
 
-  // 清零计数
   cudaMemset(ctx->d_out, 0, sizeof(uint32_t));
 
-  // 每线程处理 GRP_SIZE/2=512 个组合（批量求逆），每 block 128 线程
-  const int BLOCK        = 128;
-  const int COMBOS_PER_T = GRP_SIZE / 2;   // 512
-  uint64_t threads = (numCombos + COMBOS_PER_T - 1) / COMBOS_PER_T;
+  const int BLOCK        = ctx->block_size;
+  const int COMBOS_PER_T = ctx->optimal_nc;
+  uint64_t threads  = (numCombos + COMBOS_PER_T - 1) / COMBOS_PER_T;
   uint64_t gridSize = (threads + BLOCK - 1) / BLOCK;
   if (gridSize > 65535) gridSize = 65535;
 
-  comp_keys_abcd<<<(uint32_t)gridSize, BLOCK>>>(
-    ctx->d_ab, ctx->d_cd,
-    ctx->abSize, ctx->cdSize,
-    startCombo,
-    ctx->targetPrefix,
-    ctx->maxFound,
-    ctx->d_out);
+#define _ABCD_LAUNCH(NC) \
+  comp_keys_abcd<NC><<<(uint32_t)gridSize, BLOCK>>>( \
+    ctx->d_ab, ctx->d_ab_hw, ctx->d_ab_hw2, ctx->d_ab_sum_r13, \
+    ctx->d_cd, ctx->d_cd_hw, ctx->d_cd_hw2, ctx->d_cd_sum_r14, ctx->d_cd_sum_r15, \
+    ctx->abSize, ctx->cdSize, \
+    startCombo, ctx->targetPrefix, ctx->maxFound, ctx->d_out)
+
+  // 根据运行时选出的 NC 分发到对应模板实例
+  switch (ctx->optimal_nc) {
+    case  80:  _ABCD_LAUNCH( 80); break;
+    case  96:  _ABCD_LAUNCH( 96); break;
+    case 112:  _ABCD_LAUNCH(112); break;
+    case 128:  _ABCD_LAUNCH(128); break;
+    case 160:  _ABCD_LAUNCH(160); break;
+    case 192:  _ABCD_LAUNCH(192); break;
+    case 256:  _ABCD_LAUNCH(256); break;
+    case 512:
+    default:   _ABCD_LAUNCH(512); break;
+  }
+#undef _ABCD_LAUNCH
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -928,7 +1102,6 @@ bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
     return false;
   }
 
-  // 等待完成并拷贝结果
   cudaDeviceSynchronize();
   size_t outBytes = (1 + (size_t)ctx->maxFound * ABCD_ITEM32) * sizeof(uint32_t);
   cudaMemcpy(ctx->h_out, ctx->d_out, outBytes, cudaMemcpyDeviceToHost);
