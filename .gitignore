@@ -17,3 +17,7 @@ cmake-build-debug/
 txt/p71
 found.txt
 PuzzleSolve
+
+# 续跑脚本的运行时文件
+p71/progress.txt
+p71/.run.lock
