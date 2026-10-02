@@ -14,3 +14,4 @@ CMakeLists.txt
 VanitySearch
 cmake-build-debug/
 *.prf
+txt/p71

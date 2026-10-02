@@ -9,21 +9,19 @@
 
 using namespace std;
 
-#define RELEASE "3.0"
+#define RELEASE "4.0"
 
 struct Config {
     string target;
-    int    bits      = 0;
-    int    split     = 2;
-    string hw_filter     = "";  // hw(a&b)/hw(c&d) AND 过滤对文件，空=不过滤
-    string hw_xor_filter = "";  // hw(a^b)/hw(c^d) XOR 过滤对文件，空=不过滤
-    string hw_sum_filter = "";  // hw(a)+hw(b)/hw(c)+hw(d) 和过滤对文件，空=不过滤
-    string ab_ranges = "";      // AB 字节范围优先级文件（a=r13, b=r14）
-    string cd_ranges = "";      // CD 字节范围分区文件（c=r15, d=r16）
+    int    bits   = 0;
     map<string,string> rPaths;
-    vector<int> gpuIds   = {0};
-    vector<int> gridSize;
-    string output   = "";
+    vector<int> gpuIds = {0};
+    string output = "";
+    vector<ABRow> abRows;
+    vector<CDRow> cdRows;
+    vector<pair<int,int>> hwPairs;
+    vector<pair<int,int>> hwXorPairs;
+    int sumMod = 0, sumRem = 0;   // sum_mod = M R：(r13+r14+r15+r16) % M == R
 };
 
 static string trim(const string &s) {
@@ -33,6 +31,13 @@ static string trim(const string &s) {
 static void splitInts(const string &s, char sep, vector<int> &out) {
     stringstream ss(s); string t;
     while(getline(ss,t,sep)) { t=trim(t); if(!t.empty()) out.push_back(stoi(t)); }
+}
+static bool parse8(const string &s, uint8_t out[8]) {
+    istringstream ss(s); vector<int> nums; int x;
+    while(ss>>x) nums.push_back(x);
+    if((int)nums.size()<8) return false;
+    for(int i=0;i<8;i++) out[i]=(uint8_t)(nums[i]<0?0:nums[i]>255?255:nums[i]);
+    return true;
 }
 
 static Config parseConf(const string &path) {
@@ -47,12 +52,6 @@ static Config parseConf(const string &path) {
         auto cm=v.find('#'); if(cm!=string::npos) v=trim(v.substr(0,cm));
         if      (k=="target") cfg.target = v;
         else if (k=="bits")   cfg.bits   = stoi(v);
-        else if (k=="split")     cfg.split     = stoi(v);
-        else if (k=="hw_filter")     cfg.hw_filter     = v;
-        else if (k=="hw_xor_filter") cfg.hw_xor_filter = v;
-        else if (k=="hw_sum_filter") cfg.hw_sum_filter = v;
-        else if (k=="ab_ranges")     cfg.ab_ranges     = v;
-        else if (k=="cd_ranges")     cfg.cd_ranges     = v;
         else if (k=="r12")    cfg.rPaths["r12"]=v;
         else if (k=="r13")    cfg.rPaths["r13"]=v;
         else if (k=="r14")    cfg.rPaths["r14"]=v;
@@ -60,87 +59,34 @@ static Config parseConf(const string &path) {
         else if (k=="r16")    cfg.rPaths["r16"]=v;
         else if (k=="gpu_id") splitInts(v,',',cfg.gpuIds);
         else if (k=="output") cfg.output = v;
+        else if (k=="ab_row") {
+            uint8_t n[8]; if(parse8(v,n)) {
+                ABRow r; r.a_hi_lo=n[0]; r.a_hi_hi=n[1]; r.a_lo_lo=n[2]; r.a_lo_hi=n[3];
+                         r.b_hi_lo=n[4]; r.b_hi_hi=n[5]; r.b_lo_lo=n[6]; r.b_lo_hi=n[7];
+                cfg.abRows.push_back(r);
+            }
+        }
+        else if (k=="hw_pair") {
+            istringstream ss(v); int a, b;
+            if (ss >> a >> b) cfg.hwPairs.push_back({a, b});
+        }
+        else if (k=="xor_pair") {
+            istringstream ss(v); int a, b;
+            if (ss >> a >> b) cfg.hwXorPairs.push_back({a, b});
+        }
+        else if (k=="sum_mod") {
+            istringstream ss(v); int m, r;
+            if (ss >> m >> r && m > 0) { cfg.sumMod = m; cfg.sumRem = ((r % m) + m) % m; }
+        }
+        else if (k=="cd_row") {
+            uint8_t n[8]; if(parse8(v,n)) {
+                CDRow r; r.c_hi_lo=n[0]; r.c_hi_hi=n[1]; r.c_lo_lo=n[2]; r.c_lo_hi=n[3];
+                         r.d_hi_lo=n[4]; r.d_hi_hi=n[5]; r.d_lo_lo=n[6]; r.d_lo_hi=n[7];
+                cfg.cdRows.push_back(r);
+            }
+        }
     }
     return cfg;
-}
-
-// 从 txt 加载 (hw_ab, hw_cd) 对
-// 支持 "hw_ab hw_cd" 或 "序号 hw_ab hw_cd" 两种格式，# 开头为注释
-static vector<pair<int,int>> loadHwPairs(const string &path) {
-    vector<pair<int,int>> pairs;
-    ifstream f(path);
-    if (!f) { printf("无法打开 hw_filter 文件: %s\n", path.c_str()); exit(1); }
-    string line;
-    while (getline(f, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-        // 提取所有整数
-        istringstream ss(line);
-        vector<int> nums;
-        int x;
-        while (ss >> x) nums.push_back(x);
-        if (nums.size() == 2)
-            pairs.push_back({nums[0], nums[1]});
-        else if (nums.size() >= 3)
-            pairs.push_back({nums[1], nums[2]});  // 第一列为序号，跳过
-    }
-    return pairs;
-}
-
-// 解析一个 uint8_t 整数（0-255）
-static uint8_t parseU8(const string &s) {
-    int v = stoi(s);
-    return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
-}
-
-// 加载 AB 字节范围文件：每行 8 个整数
-// a_hi_lo a_hi_hi a_lo_lo a_lo_hi  b_hi_lo b_hi_hi b_lo_lo b_lo_hi
-static vector<ABRangeRow> loadABRanges(const string &path) {
-    vector<ABRangeRow> rows;
-    ifstream f(path);
-    if (!f) { printf("无法打开 ab_ranges 文件: %s\n", path.c_str()); exit(1); }
-    string line;
-    while (getline(f, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-        istringstream ss(line);
-        vector<int> nums;
-        int x;
-        while (ss >> x) nums.push_back(x);
-        if ((int)nums.size() < 8) continue;
-        ABRangeRow row;
-        row.a = {parseU8(to_string(nums[0])), parseU8(to_string(nums[1])),
-                 parseU8(to_string(nums[2])), parseU8(to_string(nums[3]))};
-        row.b = {parseU8(to_string(nums[4])), parseU8(to_string(nums[5])),
-                 parseU8(to_string(nums[6])), parseU8(to_string(nums[7]))};
-        rows.push_back(row);
-    }
-    return rows;
-}
-
-// 加载 CD 字节范围文件：每行 8 个整数
-// c_hi_lo c_hi_hi c_lo_lo c_lo_hi  d_hi_lo d_hi_hi d_lo_lo d_lo_hi
-static vector<CDRangeRow> loadCDRanges(const string &path) {
-    vector<CDRangeRow> rows;
-    ifstream f(path);
-    if (!f) { printf("无法打开 cd_ranges 文件: %s\n", path.c_str()); exit(1); }
-    string line;
-    while (getline(f, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == '#') continue;
-        istringstream ss(line);
-        vector<int> nums;
-        int x;
-        while (ss >> x) nums.push_back(x);
-        if ((int)nums.size() < 8) continue;
-        CDRangeRow row;
-        row.c = {parseU8(to_string(nums[0])), parseU8(to_string(nums[1])),
-                 parseU8(to_string(nums[2])), parseU8(to_string(nums[3]))};
-        row.d = {parseU8(to_string(nums[4])), parseU8(to_string(nums[5])),
-                 parseU8(to_string(nums[6])), parseU8(to_string(nums[7]))};
-        rows.push_back(row);
-    }
-    return rows;
 }
 
 static vector<uint16_t> loadR(const string &path) {
@@ -169,47 +115,26 @@ int main(int argc, char *argv[])
     Config cfg = parseConf(argv[2]);
     if(cfg.target.empty()) { printf("缺少 target\n"); return 1; }
     if(cfg.bits<=0)         { printf("缺少 bits\n");   return 1; }
-    if(cfg.rPaths.empty())  { printf("缺少 r 文件\n"); return 1; }
-
-    if(cfg.gridSize.empty())
-        for(int i=0;i<(int)cfg.gpuIds.size();i++) { cfg.gridSize.push_back(-1); cfg.gridSize.push_back(128); }
 
     vector<vector<uint16_t>> patterns;
     for(auto &k:{"r12","r13","r14","r15","r16"}) {
         auto it=cfg.rPaths.find(k);
-        if(it!=cfg.rPaths.end()) patterns.push_back(loadR(it->second));
+        if(it==cfg.rPaths.end()) { printf("缺少 %s\n",k); return 1; }
+        patterns.push_back(loadR(it->second));
     }
-    if(patterns.empty()) { printf("未加载到 r 文件\n"); return 1; }
 
     printf("PuzzleSolve v" RELEASE "  配置: %s\n", argv[2]);
+    printf("ab_row=%zu  cd_row=%zu  hw=%zu  xor=%zu\n",
+           cfg.abRows.size(), cfg.cdRows.size(),
+           cfg.hwPairs.size(), cfg.hwXorPairs.size());
+
+    vector<int> gridSize;
+    for(int i=0;i<(int)cfg.gpuIds.size();i++) { gridSize.push_back(-1); gridSize.push_back(128); }
 
     Secp256K1 *secp = new Secp256K1(); secp->Init();
     PuzzleSolve ps(secp, cfg.target, cfg.output);
-    vector<pair<int,int>> hwPairs, hwXorPairs;
-    if (!cfg.hw_filter.empty() && cfg.hw_filter != "0") {
-        hwPairs = loadHwPairs(cfg.hw_filter);
-        printf("hw AND 过滤: %s  (%zu 对)\n", cfg.hw_filter.c_str(), hwPairs.size());
-    }
-    if (!cfg.hw_xor_filter.empty() && cfg.hw_xor_filter != "0") {
-        hwXorPairs = loadHwPairs(cfg.hw_xor_filter);
-        printf("hw XOR 过滤: %s  (%zu 对)\n", cfg.hw_xor_filter.c_str(), hwXorPairs.size());
-    }
-    vector<pair<int,int>> hwSumPairs;
-    if (!cfg.hw_sum_filter.empty() && cfg.hw_sum_filter != "0") {
-        hwSumPairs = loadHwPairs(cfg.hw_sum_filter);
-        printf("hw sum 过滤: %s  (%zu 对)\n", cfg.hw_sum_filter.c_str(), hwSumPairs.size());
-    }
-    vector<ABRangeRow> abRanges;
-    vector<CDRangeRow> cdRanges;
-    if (!cfg.ab_ranges.empty() && cfg.ab_ranges != "0") {
-        abRanges = loadABRanges(cfg.ab_ranges);
-        printf("AB 范围过滤: %s  (%zu 行)\n", cfg.ab_ranges.c_str(), abRanges.size());
-    }
-    if (!cfg.cd_ranges.empty() && cfg.cd_ranges != "0") {
-        cdRanges = loadCDRanges(cfg.cd_ranges);
-        printf("CD 范围过滤: %s  (%zu 区)\n", cfg.cd_ranges.c_str(), cdRanges.size());
-    }
-    ps.Search(patterns, cfg.bits, cfg.split, cfg.gpuIds, cfg.gridSize,
-              hwPairs, hwXorPairs, abRanges, cdRanges, hwSumPairs);
+    ps.Search(patterns, cfg.bits, cfg.gpuIds, gridSize,
+              cfg.abRows, cfg.cdRows, cfg.hwPairs, cfg.hwXorPairs,
+              cfg.sumMod, cfg.sumRem);
     return 0;
 }

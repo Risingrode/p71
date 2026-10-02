@@ -47,12 +47,6 @@
 #define MADD(r,a,b,c) asm volatile ("madc.hi.u64 %0, %1, %2, %3;" : "=l"(r) : "l"(a), "l"(b), "l"(c));
 #define MADDS(r,a,b,c) asm volatile ("madc.hi.s64 %0, %1, %2, %3;" : "=l"(r) : "l"(a), "l"(b), "l"(c));
 
-// SECPK1 endomorphism constants
-__device__ __constant__ uint64_t _beta[] = { 0xC1396C28719501EEULL,0x9CF0497512F58995ULL,0x6E64479EAC3434E9ULL,0x7AE96A2B657C0710ULL };
-__device__ __constant__ uint64_t _beta2[] = { 0x3EC693D68E6AFA40ULL,0x630FB68AED0A766AULL,0x919BB86153CBCB16ULL,0x851695D49A83F8EFULL };
-
-#define HSIZE (GRP_SIZE / 2 - 1)
-
 // 64bits lsb negative inverse of P (mod 2^64)
 #define MM64 0xD838091DD2253531ULL
 // ---------------------------------------------------------------------------------------
@@ -878,35 +872,5 @@ __device__ void _ModSqr(uint64_t *rp, const uint64_t *up) {
   rp[3] = z7;
 
 #endif
-
-}
-
-// ---------------------------------------------------------------------------------------
-// Compute all ModInv of the group
-// ---------------------------------------------------------------------------------------
-
-__device__ __noinline__ void _ModInvGrouped(uint64_t r[GRP_SIZE / 2 + 1][4]) {
-
-  uint64_t subp[GRP_SIZE / 2 + 1][4];
-  uint64_t newValue[4];
-  uint64_t inverse[5];
-
-  Load256(subp[0], r[0]);
-  for (uint32_t i = 1; i < (GRP_SIZE / 2 + 1); i++) {
-    _ModMult(subp[i], subp[i - 1], r[i]);
-  }
-
-  // We need 320bit signed int for ModInv
-  Load256(inverse, subp[(GRP_SIZE / 2 + 1) - 1]);
-  inverse[4] = 0;
-  _ModInv(inverse);
-
-  for (uint32_t i = (GRP_SIZE / 2 + 1) - 1; i > 0; i--) {
-    _ModMult(newValue, subp[i - 1], inverse);
-    _ModMult(inverse, r[i]);
-    Load256(r[i], newValue);
-  }
-
-  Load256(r[0], inverse);
 
 }

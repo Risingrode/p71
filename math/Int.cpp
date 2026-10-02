@@ -701,7 +701,8 @@ void Int::ShiftL(uint32_t n) {
     uint32_t nb64 = n/64;
     uint32_t nb   = n%64;
     for(uint32_t i=0;i<nb64;i++) ShiftL64Bit();
-	  shiftL((unsigned char)nb, bits64);
+    // nb==0 时 __shiftleft128 会执行 a>>64（未定义行为），低位会被复制到高位
+    if(nb>0) shiftL((unsigned char)nb, bits64);
   }
   
 }
@@ -747,7 +748,7 @@ void Int::ShiftR(uint32_t n) {
     uint32_t nb64 = n/64;
     uint32_t nb   = n%64;
     for(uint32_t i=0;i<nb64;i++) ShiftR64Bit();
-	  shiftR((unsigned char)nb, bits64);
+    if(nb>0) shiftR((unsigned char)nb, bits64);
   }
   
 }
