@@ -27,6 +27,10 @@ typedef uint16_t prefix_t;
 // ── AB+CD 组合搜索（独立接口）─────────────────────────────
 struct ABCDContext;
 
+// 选择使用的 GPU（失败返回 false）
+bool abcdSetDevice(int gpuId);
+
+// 失败返回 nullptr
 ABCDContext *abcdSetup(
     uint64_t *abTable, uint32_t abSize,
     uint64_t *cdTable, uint32_t cdSize,

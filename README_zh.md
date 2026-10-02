@@ -1,261 +1,111 @@
-# PuzzleSolve v3.0 — Bitcoin Puzzle 私钥搜索器
+# PuzzleSolve — Bitcoin Puzzle 组合扫描器
 
-GPU 加速的比特币谜题搜索工具，通过 r 文件候选值组合定向搜索。
+给定 r12–r16 五个候选文件，把它们按位段拼成私钥，在 GPU 上穷举所有组合，找出哈希等于目标地址的那一个。
+代码基于 [VanitySearch](https://github.com/JeanLucPons/VanitySearch)（GPL v3）。
+
+只支持 **P2PKH（1 开头）** 目标地址、压缩公钥。
 
 ---
 
 ## 编译
 
 ```sh
-make gpu=1 CCAP=75 all   # GPU 版（推荐）
-make all                  # CPU 版
+make CCAP=75        # CCAP 是 GPU 计算能力：T4=75, RTX 30 系=86, RTX 40 系=89
 ```
 
----
+需要 CUDA（默认 `/usr/local/cuda`）。
 
-## 使用
+## 运行
 
 ```sh
-./PuzzleSolve --conf conf/puzzle70.conf
+./PuzzleSolve --conf p71/conf/G2G1G3G6.conf   # 单个配置
+bash p71/run_all.sh                           # 依次跑 p71/conf/ 下全部 147 个组合，找到解就停
+bash p71/run_all.sh G3G2G4G6                  # 从指定组合续跑
 ```
+
+找到后打印并追加写入 `output` 指定的文件（默认 `found.txt`，已被 `.gitignore` 忽略，**不要提交它**）。
+GPU 出错、配置有误会直接报错退出（退出码 1），不会静默跳过。
 
 ---
 
-## 配置文件
+## 私钥位段
 
-```ini
-# conf/puzzle70.conf
+`bits=71` 时私钥在 `[2^70, 2^71)`，未知位数 `bits-1 = 70`，从高位到低位分配：
 
-target=19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR   # 目标地址（P2PKH）
-bits=70                                         # 密钥位数（puzzle 70 在 [2^69, 2^70)）
-
-r12=txt/r12.txt   # 低5位候选（bits 4-0，最多32个值）
-r13=txt/r13.txt   # 次低16位（bits 20-5）
-r14=txt/r14.txt   # 中间16位（bits 36-21）
-r15=txt/r15.txt   # 次高16位（bits 52-37）
-r16=txt/r16.txt   # 最高16位（bits 68-53）
-
-split=2           # AB=r12×r13，外层=r16，CD=r14×r15
-output=found.txt
+```
+私钥 = 前导1 | r12 | r13 | r14 | r15 | r16
+              6位  16位  16位  16位  16位      （r12 取 (bits-1)%16 位，余数为 0 时取 16 位）
+shift:        64   48    32    16    0
 ```
 
----
+- AB = r12 × r13 × r14，CD = r15 × r16，GPU 扫 AB × CD 的所有点加。
+- 在 p71 配置里 a=r13、b=r14、c=r15、d=r16。
 
 ## r 文件格式
 
-每行一个 **16 位二进制**候选值，从小到大排序：
+每行一个 16 位二进制候选值（只读前 16 个字符，`#` 开头为注释）：
 
 ```
-# r13.txt  示例
-0000000000000001
-0000000001100011
-0110001001110111   ← 正确答案包含在某一行
-...
+0000000001010100
+0000000001010101
 ```
 
-**位段分配（puzzle 70，bits=70，unknownBits=69）：**
-
-```
-私钥 = 前导1 | r16(16位) | r15(16位) | r14(16位) | r13(16位) | r12(5位)
-       bit69   bit68-53    bit52-37    bit36-21    bit20-5     bit4-0
-```
-
-- **r12**：5位，最多 32 个唯一值（2^5=32）
-- **r13-r16**：各 16 位，填入分析得出的候选值
+空文件 / 无有效行会报错退出。
 
 ---
 
-## 搜索架构（详细）
+## 配置项
 
-### 总览
+```ini
+target=1PWo3JeB9jrGwfHDNpdGK38CRKd7XGabjq   # 目标地址（P2PKH）
+bits=71
+r12=p71/r12.txt
+r13=p71/data/r13_G2.txt
+r14=p71/data/r14_G1.txt
+r15=p71/data/r15_G3.txt
+r16=p71/data/r16_G6.txt
+output=found.txt
+gpu_id=0                                    # 可选，目前只用第一块
 
+# 字节范围过滤（hi 字节范围, lo 字节范围；a b / c d 各一组）
+ab_row = 32 63 0 255  0 31 0 255            # a_hi_lo a_hi_hi a_lo_lo a_lo_hi  b_hi_lo b_hi_hi b_lo_lo b_lo_hi
+cd_row = 64 95 0 255  160 191 0 255
+
+# 配对约束：(AB 侧值, CD 侧值) 必须是列表里的一对；写了几类就要同时满足几类
+hw_pair  = 4 4        # hw(a&b) , hw(c&d)
+xor_pair = 6 5        # hw(a^b) , hw(c^d)
+
+# 附加条件：(r13+r14+r15+r16) % M == R
+sum_mod = 33 24
 ```
-总组合数 = r12(15) × r13(4000) × r14(4000) × r15(4000) × r16(4000)
-         = 15 × 4000^4 = 3,840,000,000,000,000 （3840万亿）
 
-分组策略（内存限制决定）：
-  外层循环  = r16  → 4000 次迭代（最高16位，候选最多）
-  AB 表     = r12 × r13 = 15 × 4000 = 60,000 个 EC 点（4MB，全进L2缓存）
-  CD 表     = r14 × r15 = 4000 × 4000 = 16,000,000 个 EC 点（1GB，GPU显存）
-  每轮 GPU  = 60K × 16M = 960,000,000,000 组合
-```
+`hw_pair`、`xor_pair`、`sum_mod` 都可省略，省略即不启用。配对约束是**精确**的，不是各筛一遍：
+
+1. 每个条目算键 `(AND hw, XOR hw, 余数)`，AB、CD 各自按键分组；
+2. 对每个 AB 组，找出所有兼容的 CD 组并成一张 CD 表；
+3. 兼容集合相同的 AB 组合并，一次 GPU 扫描 `AB组 × 兼容CD`——不合法的组合根本不会被扫。
 
 ---
 
-### 第一步：CPU 预计算（程序启动时，只做一次）
-
-**① 计算前导点 A**
-```
-A = 2^69 × G
-  = secp256k1 生成元 G 的 2^69 倍
-  = 私钥前导"1"对应的椭圆曲线基点
-```
-
-**② 预计算 CD 表（r14 × r15 = 16M 个 EC 点）**
-```
-对每个 r14 值（4000个），计算基底点：
-  base_r14 = r14_val × 2^21 × G   （1次标量乘法）
-
-对每组 r14，批量算出4000个 r15 贡献（IntGroup批量求逆）：
-  CD[r14_idx × 4000 + r15_idx]
-    = base_r14 + r15_val × 2^5 × G   （1次点加法）
-
-总计：4000次标量乘法 + 16M次点加法（批量求逆优化，约30秒）
-内存：16M × 64字节 = 1 GB → 上传GPU显存
-```
-
----
-
-### 第二步：外层循环（r16，共4000次迭代）
-
-**每次迭代取 r16 文件中一个候选值，更新前导基点：**
+## p71 目录
 
 ```
-r16_EC = r16_val × 2^53 × G    （1次标量乘法，约50μs）
-A_cur  = A + r16_EC             （1次点加法，约2μs）
+p71/
+├── r12.txt
+├── data/            分组数据 r13_G2.txt … r16_G7.txt（G{n} = [(n-1)*8192, n*8192-1]）
+├── conf/            147 个 G 组合配置，文件名 = a b c d 的 G 编号，如 G2G1G3G6.conf
+└── run_all.sh
 ```
 
-**重建 AB 表（r12 × r13 = 60,000 个 EC 点）：**
-```
-对每个 r12 值（15个），计算：
-  base_r12 = A_cur + r12_val × 2^0 × G   （1次点加法）
+组合来自 `txt/G组合.txt`（a∈2–4, b∈1–5, c∈3–6, d∈5–7，种类数 3–4，和 8–23，极差 3–7，
+5/6/7/8 至少出现一个，c 或 d ≥ 3，a<5 或 b<6），原始候选在 `txt/p71合集/`。
 
-对每组 r12，批量算出4000个 r13 贡献：
-  AB[r12_idx × 4000 + r13_idx]
-    = base_r12 + r13_val × 2^5 × G... 
-    
-等等，r13 覆盖 bits 20-5（shift=5）：
-  AB[r12_idx × 4000 + r13_idx]
-    = base_r12 + r13_val × 2^5 × G
+## 内存与速度
 
-总计：15次标量乘法 + 60K次点加法（约1秒）
-上传GPU：60K × 64字节 = 3.75 MB（L2缓存全部命中）
-```
+- 单个组合的 AB 表最多约 1700 万条 × 64 字节 ≈ 1.1 GB（主机内存里会有一份完整表和一份分批子表），显存同量级。
+- T4 上约 450 Mkey/s；p71 全部 147 个组合合计约 9.7×10¹³ 次，单卡约 2.5 天。
+- 环境变量 `ABCD_NC`（16/24/32/48/64/96/128/192/256）可调每线程处理的组合数，默认 64。
 
----
+## 许可
 
-### 第三步：GPU 核心搜索（每次外层迭代内）
-
-**GPU 配置（Tesla T4）：**
-```
-40,960 个线程并行
-每线程处理 512 个 (AB+CD) 组合
-每次 kernel = 40,960 × 512 = 20,971,520 组合
-```
-
-**每个线程内部（512个组合，批量求逆优化）：**
-
-```
-Pass 1 —— 准备分母（512次减法）：
-  for c in 0..511:
-      dx[c] = CD[cd_idx].x - AB[ab_idx].x     ← 纯减法，极快
-
-批量求逆 _ModInvGrouped(dx)：
-  ┌─ 正常做法：512 × ModInv = 512 × 300次域乘法 = 153,600次
-  └─ 批量做法：
-       前缀积：P[0]=dx[0], P[i]=P[i-1]×dx[i]      （511次乘法）
-       1次真正的 ModInv（P[511] 的逆元）
-       回代推算：每个 inv(dx[i]) = 1次乘法         （512次乘法）
-       共 1024次乘法 + 1次ModInv ≈ 1300次域乘法
-  加速比：153,600 / 1,300 ≈ 118×
-
-Pass 2 —— 完成点加法（512次）：
-  for c in 0..511:
-      λ  = (CD.y - AB.y) × inv(CD.x - AB.x)   ← inv已知
-      Px = λ² - AB.x - CD.x
-      Py = λ(AB.x - Px) - AB.y
-      → 得到结果点 P = AB[i] + CD[j]
-
-Pass 3 —— 计算地址并比对（512次）：
-  for c in 0..511:
-      hash160 = SHA256(RIPEMD160(压缩公钥))
-      if hash160[0:2] == targetPrefix:         ← 16位快速过滤
-          if hash160 == targetHash160:         ← 完整160位比对
-              上报命中！
-```
-
----
-
-### 第四步：GPU 命中 → CPU 重建私钥
-
-```
-GPU 上报：(ab_idx, cd_idx)
-CPU 解码：
-  r12_idx = ab_idx / 4000,  r13_idx = ab_idx % 4000
-  r14_idx = cd_idx / 4000,  r15_idx = cd_idx % 4000
-  r16_idx = 当前外层迭代序号
-
-还原各文件的值：
-  r12_val = r12_file[r12_idx]   → bits 4-0  的候选值
-  r13_val = r13_file[r13_idx]   → bits 20-5
-  r14_val = r14_file[r14_idx]   → bits 36-21
-  r15_val = r15_file[r15_idx]   → bits 52-37
-  r16_val = r16_file[r16_idx]   → bits 68-53
-
-组装私钥：
-  key = 2^69
-      + r16_val × 2^53
-      + r15_val × 2^37
-      + r14_val × 2^21
-      + r13_val × 2^5
-      + r12_val × 2^0
-
-CPU验证：ComputePublicKey(key) → 地址 == 目标？ → 输出
-```
-
----
-
-### 速度分析
-
-```
-GPU 峰值（顺序扫描）：  410 Mkey/s
-AB+CD 实测速度：        330 Mkey/s
-差距原因：
-  顺序扫描  → Gn[i].x 存常量内存（L1缓存广播，零延迟）
-  AB+CD    → 随机读 AB[i] 和 CD[j]（L2缓存，有少量miss）
-
-完整搜索时间估算（Tesla T4 单卡）：
-  3840万亿 ÷ 330M = 11,636,363 秒 ≈ 135 天
-
-测试配置（当前txt）：
-  外层r16第1次 + AB[3125] + CD[0] = 50,000,000,000 次 ≈ 150秒
-```
-
----
-
-## 测试数据说明（puzzle 70）
-
-私钥 `0x349b84b6431a6c4ef1` 的各位段值：
-
-| 文件 | 位段 | 正确值 |
-|------|------|--------|
-| r12 | bits 4-0 | 17 |
-| r13 | bits 20-5 | 25207 |
-| r14 | bits 36-21 | 6355 |
-| r15 | bits 52-37 | 9650 |
-| r16 | bits 68-53 | 42204 |
-
-测试文件已配置为扫描约 **50 亿次**后找到答案。
-
----
-
-## 项目结构
-
-```
-vanitysearch/
-├── conf/puzzle70.conf   配置文件
-├── txt/r12-r16.txt      候选值文件
-├── main.cpp             入口，解析 conf
-├── Psolve.h/cpp         核心：AB+CD 组合搜索引擎
-├── GPU/GPUCombineABCD.h 自定义 GPU kernel（批量求逆）
-├── math/                大数运算（Int, IntGroup, Point）
-├── crypto/              secp256k1 曲线
-├── hash/                SHA256, RIPEMD160
-└── GPU/                 CUDA 核心（PTX 汇编优化）
-```
-
----
-
-## 许可证
-
-GPLv3 · 基于 [JeanLucPons/VanitySearch](https://github.com/JeanLucPons/VanitySearch)
+GPL v3，见源文件头部版权声明。

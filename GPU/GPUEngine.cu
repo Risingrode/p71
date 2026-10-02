@@ -52,34 +52,50 @@ static int abcdSelectNC(int gpuId)
   return nc;
 }
 
+// 任何一步 CUDA 调用失败都返回 nullptr（调用方必须终止，继续扫会读到垃圾数据而漏解）
+#define ABCD_CHECK(call) do { cudaError_t _e = (call); if (_e != cudaSuccess) { \
+    printf("abcdSetup: %s 失败: %s\n", #call, cudaGetErrorString(_e)); abcdFree(ctx); return nullptr; } } while (0)
+
+void abcdFree(ABCDContext *ctx);
+
+bool abcdSetDevice(int gpuId)
+{
+  cudaError_t e = cudaSetDevice(gpuId);
+  if (e != cudaSuccess) { printf("cudaSetDevice(%d): %s\n", gpuId, cudaGetErrorString(e)); return false; }
+  return true;
+}
+
 ABCDContext *abcdSetup(
     uint64_t *abTable, uint32_t abSize,
     uint64_t *cdTable, uint32_t cdSize,
     uint8_t *targetH160, prefix_t targetPrefix, uint32_t maxFound)
 {
   ABCDContext *ctx = new ABCDContext();
+  ctx->d_ab = ctx->d_cd = nullptr; ctx->d_out = ctx->h_out = nullptr;
   ctx->abSize=abSize; ctx->cdSize=cdSize; ctx->maxFound=maxFound;
   ctx->targetPrefix=targetPrefix;
 
   int gpuId=0; cudaGetDevice(&gpuId);
   ctx->optimal_nc = abcdSelectNC(gpuId);
 
-  cudaMalloc(&ctx->d_ab, (size_t)abSize*8*sizeof(uint64_t));
-  cudaMemcpy(ctx->d_ab, abTable, (size_t)abSize*8*sizeof(uint64_t), cudaMemcpyHostToDevice);
-  cudaMalloc(&ctx->d_cd, (size_t)cdSize*8*sizeof(uint64_t));
-  cudaMemcpy(ctx->d_cd, cdTable, (size_t)cdSize*8*sizeof(uint64_t), cudaMemcpyHostToDevice);
+  ABCD_CHECK(cudaMalloc(&ctx->d_ab, (size_t)abSize*8*sizeof(uint64_t)));
+  ABCD_CHECK(cudaMemcpy(ctx->d_ab, abTable, (size_t)abSize*8*sizeof(uint64_t), cudaMemcpyHostToDevice));
+  ABCD_CHECK(cudaMalloc(&ctx->d_cd, (size_t)cdSize*8*sizeof(uint64_t)));
+  ABCD_CHECK(cudaMemcpy(ctx->d_cd, cdTable, (size_t)cdSize*8*sizeof(uint64_t), cudaMemcpyHostToDevice));
 
-  cudaMemcpyToSymbol(_abcd_target, targetH160, 20);
+  ABCD_CHECK(cudaMemcpyToSymbol(_abcd_target, targetH160, 20));
 
   size_t outBytes = (1+(size_t)maxFound*ABCD_ITEM32)*sizeof(uint32_t);
-  cudaMalloc(&ctx->d_out, outBytes);
-  cudaHostAlloc(&ctx->h_out, outBytes, cudaHostAllocDefault);
+  ABCD_CHECK(cudaMalloc(&ctx->d_out, outBytes));
+  ABCD_CHECK(cudaHostAlloc(&ctx->h_out, outBytes, cudaHostAllocDefault));
   return ctx;
 }
 
 void abcdFree(ABCDContext *ctx) {
-  cudaFree(ctx->d_ab); cudaFree(ctx->d_cd);
-  cudaFree(ctx->d_out); cudaFreeHost(ctx->h_out);
+  if (ctx->d_ab)  cudaFree(ctx->d_ab);
+  if (ctx->d_cd)  cudaFree(ctx->d_cd);
+  if (ctx->d_out) cudaFree(ctx->d_out);
+  if (ctx->h_out) cudaFreeHost(ctx->h_out);
   delete ctx;
 }
 
@@ -89,7 +105,7 @@ bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
 {
   found.clear();
   if (numCombos==0) return true;
-  cudaMemset(ctx->d_out,0,sizeof(uint32_t));
+  if (cudaMemset(ctx->d_out,0,sizeof(uint32_t))!=cudaSuccess) { printf("ABCDKernel: cudaMemset 失败\n"); return false; }
 
   const int BLOCK=128, NC=ctx->optimal_nc;
   uint64_t threads=(numCombos+NC-1)/NC;
@@ -121,7 +137,8 @@ bool abcdLaunch(ABCDContext *ctx, uint64_t startCombo, uint64_t numCombos,
   err=cudaDeviceSynchronize();
   if (err!=cudaSuccess) { printf("ABCDKernel sync: %s\n",cudaGetErrorString(err)); return false; }
   size_t outBytes=(1+(size_t)ctx->maxFound*ABCD_ITEM32)*sizeof(uint32_t);
-  cudaMemcpy(ctx->h_out,ctx->d_out,outBytes,cudaMemcpyDeviceToHost);
+  err=cudaMemcpy(ctx->h_out,ctx->d_out,outBytes,cudaMemcpyDeviceToHost);
+  if (err!=cudaSuccess) { printf("ABCDKernel copy: %s\n",cudaGetErrorString(err)); return false; }
 
   uint32_t count=ctx->h_out[0];
   if (count>ctx->maxFound) count=ctx->maxFound;

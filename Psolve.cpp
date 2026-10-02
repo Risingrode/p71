@@ -40,6 +40,8 @@ PuzzleSolve::PuzzleSolve(Secp256K1 *secp, const string &target,
         }
     }
     if (!ok) { printf("无法解析地址: %s\n",target.c_str()); exit(1); }
+    // GPU 直接比对压缩公钥的 hash160，只对 P2PKH 地址有意义
+    if (searchType != P2PKH) { printf("仅支持 P2PKH 目标地址（1 开头）: %s\n",target.c_str()); exit(1); }
 
     targetPrefix = *(prefix_t *)targetHash160;
 
@@ -334,6 +336,9 @@ void PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
     Int leadKey; leadKey.SetInt32(1); leadKey.ShiftL((uint32_t)(bits-1));
     Point A_base = secp->ComputePublicKey(&leadKey);
 
+    if (!gpuId.empty() && !abcdSetDevice(gpuId[0])) exit(1);
+    if (gpuId.size() > 1) printf("提示: 目前只使用 gpu_id 中的第一块卡 (%d)\n", gpuId[0]);
+
     endOfSearch = false; nbFoundKey = 0;
     setvbuf(stdout, NULL, _IONBF, 0);
     double t_global = Timer::get_tick();
@@ -425,12 +430,13 @@ void PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
                 ABCDContext *ctx = abcdSetup(
                     abTable.data(), (uint32_t)A.size(), cdTable.data(), (uint32_t)C.size(),
                     targetHash160, targetPrefix, ABCD_MAX_FOUND);
+                if (!ctx) { printf("GPU 初始化失败，终止（继续会漏扫）\n"); exit(1); }
 
                 uint64_t grp_total=(uint64_t)A.size()*C.size(), grp_done=0;
                 while (grp_done<grp_total && !endOfSearch) {
                     uint64_t batch=min(BATCH,grp_total-grp_done);
                     vector<tuple<uint32_t,uint32_t,uint8_t>> hits;
-                    if (!abcdLaunch(ctx,grp_done,batch,hits)) break;
+                    if (!abcdLaunch(ctx,grp_done,batch,hits)) { printf("\nGPU 扫描失败，终止（继续会漏扫）\n"); exit(1); }
 
                     for (auto &[sub_ab,sub_cd,var]:hits) {
                         // 批内紧凑索引 → 原始索引 → verify

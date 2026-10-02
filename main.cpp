@@ -57,7 +57,7 @@ static Config parseConf(const string &path) {
         else if (k=="r14")    cfg.rPaths["r14"]=v;
         else if (k=="r15")    cfg.rPaths["r15"]=v;
         else if (k=="r16")    cfg.rPaths["r16"]=v;
-        else if (k=="gpu_id") splitInts(v,',',cfg.gpuIds);
+        else if (k=="gpu_id") { cfg.gpuIds.clear(); splitInts(v,',',cfg.gpuIds); if (cfg.gpuIds.empty()) cfg.gpuIds.push_back(0); }
         else if (k=="output") cfg.output = v;
         else if (k=="ab_row") {
             uint8_t n[8]; if(parse8(v,n)) {
@@ -100,7 +100,7 @@ static vector<uint16_t> loadR(const string &path) {
         for(char c:line) { if(c!='0'&&c!='1'){ok=false;break;} v=(v<<1)|(c=='1'); }
         if(ok) r.push_back(v);
     }
-    if(r.empty()) printf("警告: %s 无有效数据\n",path.c_str());
+    if(r.empty()) { printf("错误: %s 无有效数据\n",path.c_str()); exit(1); }
     return r;
 }
 

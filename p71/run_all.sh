@@ -9,6 +9,6 @@ for conf in p71/conf/*.conf; do
   if [ $skip -eq 1 ]; then [ "$name" = "$start" ] && skip=0 || continue; fi
   echo "===== $name ====="
   before=$(size)
-  ./PuzzleSolve --conf "$conf"
+  ./PuzzleSolve --conf "$conf" || { echo "$name 运行失败（退出码 $?），已停止，修复后可用: bash p71/run_all.sh $name 续跑"; exit 1; }
   if [ "$(size)" != "$before" ]; then echo "找到解: $name，见 found.txt"; exit 0; fi
 done
