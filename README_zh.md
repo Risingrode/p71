@@ -10,7 +10,8 @@
 ## 编译
 
 ```sh
-make CCAP=75        # CCAP 是 GPU 计算能力：T4=75, RTX 30 系=86, RTX 40 系=89
+make                # 自动用 nvidia-smi 探测 GPU 计算能力
+make CCAP=75        # 也可手动指定：T4=75, RTX 30 系=86, RTX 40 系=89；改头文件后会自动重编相关文件
 ```
 
 需要 CUDA（默认 `/usr/local/cuda`）。
@@ -24,7 +25,13 @@ bash p71/run_all.sh G3G2G4G6                  # 从指定组合续跑
 ```
 
 找到后打印并追加写入 `output` 指定的文件（默认 `found.txt`，已被 `.gitignore` 忽略，**不要提交它**）。
-GPU 出错、配置有误会直接报错退出（退出码 1），不会静默跳过。
+
+**退出码**：`0` = 扫完未找到，`10` = 找到解，`1` = 配置或运行错误（`run_all.sh` 据此决定是否停止）。
+
+**严格校验**：配置或数据有任何问题都直接报错退出，不会静默丢弃——
+未知配置项、`ab_row`/`cd_row` 不是 8 个 0–255 的整数、`hw_pair`/`xor_pair` 不是 2 个 0–16 的整数、
+`bits` 不在 66..81、r 文件有一行不是恰好 16 位 0/1、目标地址不是校验和正确的 P2PKH 地址，都会指出行号后终止。
+GPU 命中却通不过 CPU 验证时会打印 `!!!` 警告（说明位段映射有 bug）。
 
 ---
 
@@ -57,7 +64,7 @@ shift:        64   48    32    16    0
 ## 配置项
 
 ```ini
-target=1PWo3JeB9jrGwfHDNpdGK38CRKd7XGabjq   # 目标地址（P2PKH）
+target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU   # 目标地址（P2PKH）
 bits=71
 r12=p71/r12.txt
 r13=p71/data/r13_G2.txt

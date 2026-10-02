@@ -1,10 +1,6 @@
 #include "Psolve.h"
-#ifndef ABCD_MAX_FOUND
-#define ABCD_MAX_FOUND 1024
-#endif
 #include "encoding/Base58.h"
-#include "encoding/Bech32.h"
-#include "hash/ripemd160.h"
+#include "hash/sha256.h"
 #include "math/IntGroup.h"
 #include "util/Timer.h"
 #include <string.h>
@@ -25,23 +21,22 @@ PuzzleSolve::PuzzleSolve(Secp256K1 *secp, const string &target,
     this->endOfSearch = false;
     this->targetAddr = target;
 
-    bool ok = false;
-    if (!target.empty() && (target[0]=='1'||target[0]=='3')) {
-        vector<unsigned char> dec;
-        if (DecodeBase58(target,dec) && dec.size()==25) {
-            searchType = (target[0]=='1') ? P2PKH : P2SH;
-            memcpy(targetHash160, dec.data()+1, 20); ok=true;
-        }
-    } else if (target.size()>3 && (target[0]=='b'||target[0]=='B')) {
-        uint8_t wp[40]; size_t wplen; int wv;
-        string la=target; for(auto &c:la) c=tolower(c);
-        if (segwit_addr_decode(&wv,wp,&wplen,"bc",la.c_str())&&wplen==20){
-            searchType=BECH32; memcpy(targetHash160,wp,20); ok=true;
-        }
+    // 仅支持 P2PKH：GPU 直接比对压缩公钥的 hash160。校验 长度 / 字符集 / 版本字节 / 校验和，
+    // 地址输错一个字符就会让 GPU 白扫几天一个不可能命中的 hash
+    vector<unsigned char> dec;
+    if (target.size() < 26 || target.size() > 35 || target[0] != '1' ||
+        !DecodeBase58(target.c_str(), dec) || dec.size() != 25 || dec[0] != 0x00) {
+        printf("目标必须是合法的 P2PKH 地址（1 开头，25 字节）: %s\n", target.c_str()); exit(1);
     }
-    if (!ok) { printf("无法解析地址: %s\n",target.c_str()); exit(1); }
-    // GPU 直接比对压缩公钥的 hash160，只对 P2PKH 地址有意义
-    if (searchType != P2PKH) { printf("仅支持 P2PKH 目标地址（1 开头）: %s\n",target.c_str()); exit(1); }
+    uint8_t h1[32], h2[32];
+    sha256(dec.data(), 21, h1);
+    sha256(h1, 32, h2);
+    if (memcmp(h2, dec.data()+21, 4) != 0) {
+        printf("目标地址校验和错误（地址输错了？）: %s\n", target.c_str()); exit(1);
+    }
+    memcpy(targetHash160, dec.data()+1, 20);
+    searchType = P2PKH;
+    this->badHits = 0;
 
     targetPrefix = *(prefix_t *)targetHash160;
 
@@ -210,50 +205,6 @@ void PuzzleSolve::buildCombinedTable(const vector<vector<uint16_t>> &pats,
     delete grp;
 }
 
-// GPU 命中后 CPU 端验证：重建私钥，计算地址，确认匹配后输出
-bool PuzzleSolve::verifyAndOutput(
-    uint32_t ab_idx, uint32_t cd_idx,
-    const vector<vector<uint16_t>> &abPats,
-    const vector<vector<uint16_t>> &cdPats,
-    int bits)
-{
-    vector<int> abVals, cdVals;
-    decodeIdx(ab_idx, abPats, abVals);
-    decodeIdx(cd_idx, cdPats, cdVals);
-
-    // allPats 顺序 = [r12, r13, r14, r15, r16]（LSB-first，r12=最低位）
-    vector<vector<uint16_t>> allPats(abPats);
-    allPats.insert(allPats.end(), cdPats.begin(), cdPats.end());
-    vector<int> allVals(abVals);
-    allVals.insert(allVals.end(), cdVals.begin(), cdVals.end());
-
-    Int k;
-    k.SetInt32(0);
-    int unknownBits = bits - 1;
-    int firstChunk  = unknownBits % 16;
-    if (firstChunk == 0) firstChunk = 16;
-
-    // 与 computeShifts 一致：从高位往低位，r12 在最高段
-    int bitPos = unknownBits;
-    for (int i = 0; i < (int)allPats.size() && bitPos > 0; i++) {
-        int chunk = (i == 0) ? firstChunk : min(16, bitPos);
-        bitPos -= chunk;
-        uint32_t mask = (1u << chunk) - 1;
-        uint32_t val  = allPats[i][allVals[i]] & mask;
-        Int seg; seg.SetInt32(val); seg.ShiftL((uint32_t)bitPos);
-        k.Add(&seg);
-    }
-    Int lead; lead.SetInt32(1); lead.ShiftL((uint32_t)unknownBits);
-    k.Add(&lead);
-
-    Point p   = secp->ComputePublicKey(&k);
-    string addr = secp->GetAddress(searchType, true, p);
-    if (addr != targetAddr) return false;
-
-    output(addr, secp->GetPrivAddress(true, k), k.GetBase16());
-    return true;
-}
-
 // 各文件在私钥中的起始位（MSB-first：r12=最高位，r16=最低位）
 // 二进制从左到右：[r12(含前导1)][r13][r14][r15][r16]
 // r12 拿余数位（unknownBits%16），放在最高段；r13-r16 各拿完整 16 位
@@ -276,26 +227,74 @@ static void computeShifts(const vector<vector<uint16_t>> &pats, int bits,
     }
 }
 
+// GPU 命中后 CPU 端验证：重建私钥，计算地址，确认匹配后输出
+bool PuzzleSolve::verifyAndOutput(
+    uint32_t ab_idx, uint32_t cd_idx,
+    const vector<vector<uint16_t>> &abPats,
+    const vector<vector<uint16_t>> &cdPats,
+    int bits)
+{
+    vector<int> abVals, cdVals;
+    decodeIdx(ab_idx, abPats, abVals);
+    decodeIdx(cd_idx, cdPats, cdVals);
+
+    // allPats 顺序 = [r12, r13, r14, r15, r16]（LSB-first，r12=最低位）
+    vector<vector<uint16_t>> allPats(abPats);
+    allPats.insert(allPats.end(), cdPats.begin(), cdPats.end());
+    vector<int> allVals(abVals);
+    allVals.insert(allVals.end(), cdVals.begin(), cdVals.end());
+
+    // 与 GPU 建表使用同一套 shift/chunk，避免两处各自实现而不一致
+    vector<int> shifts, chunks;
+    computeShifts(allPats, bits, shifts, chunks);
+
+    Int k;
+    k.SetInt32(0);
+    int unknownBits = bits - 1;
+    for (int i = 0; i < (int)allPats.size(); i++) {
+        uint32_t mask = (chunks[i] >= 16) ? 0xFFFFu : ((1u << chunks[i]) - 1u);
+        uint32_t val  = allPats[i][allVals[i]] & mask;
+        Int seg; seg.SetInt32(val); seg.ShiftL((uint32_t)shifts[i]);
+        k.Add(&seg);
+    }
+    Int lead; lead.SetInt32(1); lead.ShiftL((uint32_t)unknownBits);
+    k.Add(&lead);
+
+    Point p   = secp->ComputePublicKey(&k);
+    string addr = secp->GetAddress(searchType, true, p);
+    if (addr != targetAddr) return false;
+
+    output(addr, secp->GetPrivAddress(true, k), k.GetBase16());
+    return true;
+}
+
 // 升级版主搜索（主机端 hw 预筛 + GPU 单次扫描）
 // patterns = [r12, r13, r14, r15, r16]
 // AB = r12×r13×r14，CD = r15×r16
 // 流程：字节范围预过滤 → 计算 hw 数组 → 独立预筛 → GPU 单次扫描
-void PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
+int PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
                           int bits,
-                          vector<int> gpuId, vector<int> gridSize,
+                          vector<int> gpuId,
                           const vector<ABRow> &abRows,
                           const vector<CDRow> &cdRows,
                           const vector<pair<int,int>> &hwPairs,
                           const vector<pair<int,int>> &hwXorPairs,
                           int sumMod, int sumRem)
 {
-    if (patterns.size() < 5) { printf("需要 5 个文件 (r12-r16)\n"); return; }
+    if (patterns.size() < 5) { printf("需要 5 个文件 (r12-r16)\n"); return 0; }
 
     vector<vector<uint16_t>> abPats(patterns.begin(), patterns.begin()+3);
     vector<vector<uint16_t>> cdPats(patterns.begin()+3, patterns.end());
 
     vector<int> allShifts, allChunks;
     computeShifts(patterns, bits, allShifts, allChunks);
+    // 取位掩码后相同的候选只会重复扫描（浪费时间，不影响正确性）
+    for (size_t i=0;i<patterns.size();i++) {
+        uint32_t mask = (allChunks[i] >= 16) ? 0xFFFFu : ((1u << allChunks[i]) - 1u);
+        map<uint32_t,int> seen; size_t dup=0;
+        for (auto v:patterns[i]) if (seen[v & mask]++) dup++;
+        if (dup) printf("警告: r%zu 有 %zu 个候选在取低 %d 位后重复\n", i+12, dup, allChunks[i]);
+    }
     vector<int> abShifts(allShifts.begin(), allShifts.begin()+3);
     vector<int> cdShifts(allShifts.begin()+3, allShifts.end());
     vector<int> abChunks(allChunks.begin(), allChunks.begin()+3);
@@ -443,6 +442,10 @@ void PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
                         if (verifyAndOutput(A[sub_ab],C[sub_cd],abSub,cdSub,bits)) {
                             nbFoundKey++; endOfSearch=true; break;
                         }
+                        // GPU 已比对完整 160 位 hash，CPU 却验证不过 → 索引/位段映射有 bug，真解可能被丢
+                        badHits++;
+                        printf("\n!!! 警告: GPU 命中但 CPU 验证失败 (AB%d/CD%d ab_idx=%u cd_idx=%u)，请检查位段映射 !!!\n",
+                               ai+1, ci+1, A[sub_ab], C[sub_cd]);
                     }
                     grp_done+=batch; done+=batch; totalDone+=batch;
                     double dt=Timer::get_tick()-t_global;
@@ -457,4 +460,6 @@ void PuzzleSolve::Search(vector<vector<uint16_t>> &patterns,
         }
     }
     printf("\n");
+    if (badHits) printf("!!! 共有 %d 次 GPU 命中未通过 CPU 验证，本次扫描结果不可信 !!!\n", badHits);
+    return nbFoundKey;
 }

@@ -47,6 +47,8 @@ bool DecodeBase58(const char* psz, std::vector<uint8_t> &vch) {
   }
 
   int length = (int)strlen(psz);
+  if (length > 300)   // digits[] 只有 256 字节，防止栈溢出
+    return false;
 
   // Process the characters
   int digitslen = 1;

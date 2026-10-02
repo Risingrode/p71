@@ -5,7 +5,6 @@
 #define GPU_COMBINE_ABCD_H
 
 #define ABCD_ITEM32    3
-#define ABCD_MAX_FOUND 1024
 #ifndef ABCD_DEFAULT_NC
 #define ABCD_DEFAULT_NC 64
 #endif

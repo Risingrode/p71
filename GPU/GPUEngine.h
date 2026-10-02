@@ -24,6 +24,9 @@
 
 typedef uint16_t prefix_t;
 
+// 单次 GPU 扫描最多上报的命中数
+#define ABCD_MAX_FOUND 1024
+
 // ── AB+CD 组合搜索（独立接口）─────────────────────────────
 struct ABCDContext;
 

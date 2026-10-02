@@ -40,9 +40,10 @@ public:
 
     // patterns = [r12, r13, r14, r15, r16]
     // AB = r12×r13×r14，CD = r15×r16，GPU 全速扫 AB×CD
-    void Search(std::vector<std::vector<uint16_t>> &patterns,
+    // 返回找到的密钥个数（0 = 扫完未找到）
+    int Search(std::vector<std::vector<uint16_t>> &patterns,
                 int bits,
-                std::vector<int> gpuId, std::vector<int> gridSize,
+                std::vector<int> gpuId,
                 const std::vector<ABRow> &abRows,
                 const std::vector<CDRow> &cdRows,
                 const std::vector<std::pair<int,int>> &hwPairs    = {},
@@ -81,6 +82,7 @@ private:
     int         searchType;
     bool        endOfSearch;
     int         nbFoundKey;
+    int         badHits;     // GPU 命中但 CPU 验证失败的次数（正常应为 0）
     std::string outputFile;
 
 #ifndef WIN64
